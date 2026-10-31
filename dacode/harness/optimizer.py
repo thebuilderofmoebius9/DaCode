@@ -201,7 +201,7 @@ class HarnessOptimizer:
                 elapsed_s=round(time.perf_counter() - started, 3),
                 tests_skipped=getattr(report, "tests_skipped", 0),
                 model=variant.model or getattr(self.executor, "model", None),
-                gate_output=(getattr(report, "stdout", "") or "")[-4000:],
+                gate_output=_gate_evidence(report),
                 errors=[f.check for f in getattr(report, "findings", []) if f.severity == "error"],
             )
         except Exception as exc:  # noqa: BLE001 - a failed trial must not kill the run
@@ -564,6 +564,19 @@ class HarnessOptimizer:
 
 
 # -- helpers ---------------------------------------------------------------
+
+
+def _gate_evidence(report: object) -> str:
+    """The gate's own output, for the evidence trail.
+
+    ``unittest`` suites print their summary to stderr and a gate that timed out
+    (124), was refused by isolation (125) or found no command (127) writes only
+    to stderr — stdout alone reads as "no gate output" and the executor's
+    chatter gets reported as evidence instead. Both streams belong here.
+    """
+    stdout = (getattr(report, "stdout", "") or "").strip()
+    stderr = (getattr(report, "stderr", "") or "").strip()
+    return "\n".join(part for part in (stdout, stderr) if part)[-4000:]
 
 
 def _variant_score(result: ProbeResult) -> float:

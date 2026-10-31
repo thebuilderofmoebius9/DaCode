@@ -180,6 +180,23 @@ def allowed_env(
     return {name: source[name] for name in dict.fromkeys(names) if name in source}
 
 
+def exposes_home(path: str | Path, home: str | Path | None = None) -> bool:
+    """Would mounting ``path`` re-expose the home directory?
+
+    True when the path *is* ``$HOME``, an ancestor of it, or a directory/file
+    under it that holds credentials (see :func:`_is_home_secret`). Bind targets
+    that pass this check are safe to expose read-write; the rest must stay out.
+    """
+    home_path = Path(home).expanduser().resolve() if home is not None else Path.home().resolve()
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except OSError:
+        return True  # unreadable/unresolvable path: fail closed
+    if resolved == home_path or home_path.is_relative_to(resolved):
+        return True
+    return _is_home_secret(resolved, home_path)
+
+
 def wrap_command(
     command: Sequence[str],
     *,
@@ -187,6 +204,7 @@ def wrap_command(
     policy: IsolationPolicy,
     env: dict[str, str] | None = None,
     home: str | Path | None = None,
+    read_only_workspace: bool = False,
 ) -> list[str]:
     """Prefix ``command`` with a bwrap invocation implementing ``policy``."""
     if not policy.enabled:
@@ -252,7 +270,11 @@ def wrap_command(
         if target.is_dir():
             argv += ["--bind", str(target), str(target)]
 
-    argv += ["--bind", str(workspace_path), str(workspace_path)]
+    # A read-only workspace bind is for runs that only measure (the untouched
+    # repo's baseline): the gate's sandbox must not be able to write the main
+    # checkout. Trial workspaces stay read-write — that is where trials commit.
+    bind_flag = "--ro-bind" if read_only_workspace else "--bind"
+    argv += [bind_flag, str(workspace_path), str(workspace_path)]
 
     # Protected re-binds come after the writable binds (including workspace_path)
     # so they shadow them: a read-only mount on a child of a writable parent is
@@ -332,28 +354,18 @@ def _bind_candidates(path: Path, *, home: Path | None = None) -> list[Path]:
     home_path = home or Path.home().resolve()
     out: list[Path] = []
 
-    def _exposes_home(candidate: Path) -> bool:
-        """$HOME, an ancestor of it, or a credentials directory under it."""
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            return False
-        if resolved == home_path or home_path.is_relative_to(resolved):
-            return True
-        return _is_home_secret(resolved, home_path)
-
     for candidate in (path,):
-        if candidate.exists() and not _exposes_home(candidate):
+        if candidate.exists() and not exposes_home(candidate, home=home_path):
             out.append(candidate)
     try:
         real = path.resolve()
     except OSError:
         real = None
     if real is not None and real != path:
-        if real.exists() and not _exposes_home(real):
+        if real.exists() and not exposes_home(real, home=home_path):
             out.append(real)
         prefix = real.parent.parent  # <prefix>/bin/python → <prefix>
-        if prefix.exists() and not _exposes_home(prefix):
+        if prefix.exists() and not exposes_home(prefix, home=home_path):
             # Never bind a top-level directory of $HOME (~/.local, ~/.hermes) just
             # because a symlink resolved inside it: that exposes the state store and
             # anything else kept there. Bind the immediate parent instead.

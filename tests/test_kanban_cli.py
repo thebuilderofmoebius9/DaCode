@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dacode import cli
 
 
@@ -29,7 +31,9 @@ def test_kanban_work_dispatches_to_work_with_a_ttl_covering_the_run(monkeypatch,
     )
     assert rc == 3
     assert seen["task_id"] == "t_9" and seen["board"] == "b"
-    assert seen["ttl"] == 2 * 2 * 100 + 600
+    # Each variant can burn a full timeout in the executor AND another in the
+    # critic's gate; the baseline spends one more before round one.
+    assert seen["ttl"] == 2 * 2 * (2 * 100) + 100 + 600
     assert callable(seen["run_card"])
 
 
@@ -40,3 +44,10 @@ def test_kanban_work_honours_an_explicit_ttl(monkeypatch, tmp_path):
     monkeypatch.setattr(kanban, "work", lambda *a, ttl: seen.setdefault("ttl", ttl) and 0)
     cli.main(["--repo", str(tmp_path), "kanban", "work", "t_9", "--ttl", "77"])
     assert seen["ttl"] == 77
+
+
+def test_kanban_work_refuses_a_non_positive_ttl(tmp_path):
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            ["--repo", str(tmp_path), "kanban", "work", "t_9", "--ttl", "0"]
+        )

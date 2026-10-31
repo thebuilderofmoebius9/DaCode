@@ -28,6 +28,16 @@ from dacode.sandbox import GitSandbox
 __all__ = ["main", "build_parser"]
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"--ttl must be positive, got {parsed}")
+    return parsed
+
+
 def _add_run_options(p: argparse.ArgumentParser) -> None:
     """Options shared by `run` and `kanban work` — one card is one rig run."""
     p.add_argument("--budget", type=int, default=2, help="Harness² recursion rounds")
@@ -122,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     kwork.add_argument("task_id", help="Kanban card id, e.g. t_1485ddf4")
     kwork.add_argument("--board", default=None, help="board slug (default: DACODE_KANBAN_BOARD or the current board)")
-    kwork.add_argument("--ttl", type=int, default=None, help="claim TTL in seconds (default: covers the whole run)")
+    kwork.add_argument("--ttl", type=_positive_int, default=None, help="claim TTL in seconds (default: covers the whole run)")
     _add_run_options(kwork)
 
     mcp = sub.add_parser("mcp", help="serve memory + run history over MCP (stdio)")
@@ -433,8 +443,17 @@ def main(argv: list[str] | None = None) -> int:
 
         cfg = _make_config(args)
         # The claim must outlive every round, or a second worker can take the card.
-        ttl = args.ttl or int(cfg.budget * cfg.variants_per_round * cfg.variant_timeout) + 600
-        return work(args.task_id, HermesKanban(args.board), make_rig_runner(cfg), ttl=ttl)
+        # Each variant can burn a full timeout in the executor AND another in the
+        # critic's gate (plus the baseline measurement before round one) — a TTL
+        # sized for the executor alone loses the claim mid-gate on slow suites.
+        per_variant = 2 * cfg.variant_timeout
+        ttl = args.ttl or int(cfg.budget * cfg.variants_per_round * per_variant + cfg.variant_timeout) + 600
+        return work(
+            args.task_id,
+            HermesKanban(args.board),
+            make_rig_runner(cfg, explicit_repo=getattr(args, "repo", None)),
+            ttl=ttl,
+        )
 
     if args.command == "run":
         cfg = _make_config(args)

@@ -141,10 +141,13 @@ class PstackCritic:
 
         A trial that deletes tests or silences them with skips keeps the suite
         green without proving anything; the baseline is what makes that visible.
+        The gate runs with the repo bound read-only: this is a measurement on
+        the live main checkout, not a trial worktree — the suite under test is
+        still untrusted code.
         """
         try:
             _exit, _out, _err, total, _failed, skipped, _note, _source = self._run_tests(
-                Path(repo)
+                Path(repo), read_only=True
             )
         except Exception:  # noqa: BLE001 - a missing baseline must never block a run
             return None
@@ -156,12 +159,14 @@ class PstackCritic:
         return (max(total, static), skipped)
 
     def _wrap(
-        self, cmd: list[str], workspace: Path, *, policy=None
+        self, cmd: list[str], workspace: Path, *, policy=None, read_only: bool = False
     ) -> list[str]:
         """Run the gate under bwrap when isolation is on.
 
         A suite is model-written code too: it must not reach the network, the
-        user's home, or anything outside its own worktree.
+        user's home, or anything outside its own worktree. ``read_only`` binds
+        the workspace read-only — for the baseline, which measures the live
+        main checkout instead of a disposable trial worktree.
         """
         active = policy if policy is not None else self.isolation
         if active is None or not active.enabled:
@@ -173,10 +178,12 @@ class PstackCritic:
         # Fail closed: an isolated run that silently fell back to the host would be
         # worse than a failed gate. The exception is re-raised as a failed probe by
         # _run_tests (exit 125) so the caller sees a verdict, not a traceback.
-        return wrap_command(cmd, workspace=workspace, policy=policy)
+        return wrap_command(
+            cmd, workspace=workspace, policy=policy, read_only_workspace=read_only
+        )
 
     def _run_once(
-        self, command: Sequence[str], workspace: Path
+        self, command: Sequence[str], workspace: Path, *, read_only: bool = False
     ) -> tuple[int, str, str, int, int, int, str | None, bool]:
         """One gate run. Counts come from a JUnit report when pytest can write one.
 
@@ -208,7 +215,7 @@ class PstackCritic:
                 )
         try:
             proc = subprocess.run(
-                self._wrap(cmd, workspace, policy=policy),
+                self._wrap(cmd, workspace, policy=policy, read_only=read_only),
                 cwd=str(workspace),
                 capture_output=True,
                 text=True,
@@ -270,19 +277,19 @@ class PstackCritic:
         return proc.returncode, proc.stdout, proc.stderr, *counts, note, counts_source
 
     def _run_tests(
-        self, workspace: Path
+        self, workspace: Path, *, read_only: bool = False
     ) -> tuple[int, str, str, int, int, int, str | None, bool]:
-        result = self._run_once(list(self.test_command), workspace)
+        result = self._run_once(list(self.test_command), workspace, read_only=read_only)
         if result[3] == 0 and result[0] == 0:
             # A green run with no counts usually means the project's own addopts
             # already contain -q ("-qq" prints nothing). Re-run with them neutralised.
-            retried = self._neutralised_run(workspace)
+            retried = self._neutralised_run(workspace, read_only=read_only)
             if retried is not None:
                 return retried
         return result
 
     def _neutralised_run(
-        self, workspace: Path
+        self, workspace: Path, *, read_only: bool = False
     ) -> tuple[int, str, str, int, int, int, str | None, bool] | None:
         """Re-run with ``-o addopts=`` so a quiet project config cannot look like 0 tests."""
         if not self.test_command or not _pytest_like(self.test_command):
@@ -290,7 +297,7 @@ class PstackCritic:
             # custom command breaks the re-run instead of un-quieting it.
             return None
         cmd = [*self.test_command, "-o", "addopts="]
-        result = self._run_once(cmd, workspace)
+        result = self._run_once(cmd, workspace, read_only=read_only)
         if result[3] == 0:
             return None
         return result

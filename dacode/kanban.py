@@ -28,6 +28,8 @@ from typing import Any, Callable
 
 from dacode import runlog
 from dacode.redact import redact, redact_event
+from dacode.sandbox import GitSandbox
+from dacode.sandbox.bwrap import exposes_home
 
 __all__ = [
     "KanbanError",
@@ -50,12 +52,22 @@ DEFAULT_TIMEOUT = 60  # seconds per board call
 #: Runner signature: ``runner(argv) -> object with returncode/stdout/stderr``.
 Runner = Callable[[list[str]], Any]
 
+#: Output markers that mean *contention* — someone else holds the claim. Any
+#: other failure (typo'd id, unknown board, broken CLI) must not be reported
+#: as "another worker owns the card"; it raises instead.
+_CLAIM_HELD_MARKERS = ("status=running", "lock=")
+
 
 def parse_gate(body: str | None) -> str | None:
     """The stripped content of the FIRST fenced block info-tagged exactly ``gate``.
 
     Multi-line commands survive intact (only the whole block is stripped). A
-    plain ```` ```bash ```` block is not a gate; neither is an empty one.
+    plain ```` ```bash ```` block is not a gate; neither is an empty one. Fences
+    follow the CommonMark rule that closes them: a closing fence is a line of
+    nothing but backticks, at least as many as the opening fence — so a
+    ```` ```gate ```` block with no closing fence is not a gate (the rest of the
+    card would otherwise be handed to ``bash -c``), and a `````markdown
+    example block containing an inner ```` ```gate ```` line stays one block.
     """
     if not body:
         return None
@@ -66,16 +78,23 @@ def parse_gate(body: str | None) -> str | None:
         if not stripped.startswith("```"):
             i += 1
             continue
-        info = stripped[3:].strip()
+        k = len(stripped) - len(stripped.lstrip("`"))  # opening fence width (>= 3)
+        info = stripped[k:].strip()
         buf: list[str] = []
         i += 1
-        while i < n and not lines[i].strip().startswith("```"):
+        closed = False
+        while i < n:
+            cur = lines[i].strip()
+            if cur and set(cur) <= {"`"} and len(cur) >= k:
+                closed = True
+                break
             buf.append(lines[i])
             i += 1
-        if info == "gate":
+        if info == "gate" and closed:
             content = "\n".join(buf).strip()
             return content or None
-        i += 1  # some other fenced block: skip past its closing fence
+        if closed:
+            i += 1  # some other fenced block: skip past its closing fence
     return None
 
 
@@ -108,7 +127,17 @@ class HermesKanban:
 
     @staticmethod
     def _run(argv: list[str]) -> Any:
-        return subprocess.run(argv, capture_output=True, text=True, timeout=DEFAULT_TIMEOUT)
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=DEFAULT_TIMEOUT)
+        except FileNotFoundError as exc:
+            # A missing binary is a setup error, not a claim conflict: surface it
+            # as a failed board call with the message a human can act on.
+            missing = exc.filename or argv[0]
+            return subprocess.CompletedProcess(argv, 127, stdout="", stderr=f"{missing} not found on PATH")
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                argv, 124, stdout="", stderr=f"{argv[0]} did not answer within {DEFAULT_TIMEOUT}s"
+            )
 
     def _argv(self, verb_args: list[str]) -> list[str]:
         argv = [self.binary, "kanban"]
@@ -121,22 +150,35 @@ class HermesKanban:
         return KanbanError(detail or f"{action} failed with exit {proc.returncode}")
 
     def show(self, task_id: str) -> dict:
-        proc = self._runner(self._argv(["show", task_id, "--json"]))
+        proc = self._runner(self._argv(["show", "--json", "--", task_id]))
         if proc.returncode != 0:
             raise self._fail(f"show {task_id}", proc)
-        return json.loads(proc.stdout or "{}")["task"]
+        try:
+            return json.loads(proc.stdout or "{}")["task"]
+        except (json.JSONDecodeError, KeyError) as exc:
+            raise KanbanError(
+                f"show {task_id}: unreadable board response ({exc.__class__.__name__})"
+            ) from exc
 
     def claim(self, task_id: str, ttl: int) -> bool:
-        proc = self._runner(self._argv(["claim", task_id, "--ttl", str(ttl)]))
-        return proc.returncode == 0
+        proc = self._runner(self._argv(["claim", "--ttl", str(ttl), "--", task_id]))
+        if proc.returncode == 0:
+            return True
+        output = f"{proc.stderr or ''}\n{proc.stdout or ''}"
+        if any(marker in output for marker in _CLAIM_HELD_MARKERS):
+            return False  # genuine contention: someone else holds the claim
+        raise self._fail(f"claim {task_id}", proc)
 
     def complete(self, task_id: str, result: str, metadata: dict) -> None:
         proc = self._runner(
             self._argv(
                 [
-                    "complete", task_id,
-                    "--result", result,
-                    "--metadata", json.dumps(metadata, ensure_ascii=False),
+                    # `--opt=value` keeps a dash-leading result/metadata from being
+                    # parsed as flags; `--` does the same for the positionals.
+                    "complete",
+                    f"--result={result}",
+                    f"--metadata={json.dumps(metadata, ensure_ascii=False)}",
+                    "--", task_id,
                 ]
             )
         )
@@ -144,37 +186,59 @@ class HermesKanban:
             raise self._fail(f"complete {task_id}", proc)
 
     def block(self, task_id: str, reason: str, kind: str | None = None) -> None:
-        verb_args = ["block", task_id]
+        verb_args = ["block"]
         if kind:
-            verb_args += ["--kind", kind]
-        verb_args.append(reason)
+            verb_args += [f"--kind={kind}"]
+        verb_args += ["--", task_id, reason]
         proc = self._runner(self._argv(verb_args))
         if proc.returncode != 0:
             raise self._fail(f"block {task_id}", proc)
+
+
+def _blocked(board: HermesKanban, task_id: str, reason: str, *, kind: str | None = None) -> bool:
+    """Block the card; False (with a stderr note) when the board refused."""
+    try:
+        board.block(task_id, reason, kind=kind)
+        return True
+    except KanbanError as exc:
+        print(f"[kanban] {task_id}: block refused: {exc}", file=sys.stderr)
+        return False
 
 
 def work(task_id: str, board: HermesKanban, run_card: Callable[..., CardOutcome], *, ttl: int = 3600) -> int:
     """Claim one card, run it through the rig, report the outcome.
 
     Exit codes: 0 complete, 1 gate failed / rig error, 2 no gate, 3 claim
-    refused, 4 the board lost our claim on completion.
+    refused (someone else holds it), 4 the board lost our claim on
+    completion/block, 5 the board call itself failed (no claim ever held).
     """
-    if not board.claim(task_id, ttl):
+    try:
+        claimed = board.claim(task_id, ttl)
+    except KanbanError as exc:
+        # A typo'd id, an unknown board, a broken hermes — none of that is
+        # contention, and none of it should wear the "another worker" story.
+        print(f"[kanban] {task_id}: claim failed: {exc}", file=sys.stderr)
+        return 5
+    if not claimed:
         print(f"[kanban] {task_id}: claim refused — another worker owns the card", file=sys.stderr)
         return 3
 
-    task = board.show(task_id)
+    try:
+        task = board.show(task_id)
+    except KanbanError as exc:
+        print(f"[kanban] {task_id}: show failed: {exc}", file=sys.stderr)
+        return 5
     gate = parse_gate(task.get("body"))
     if not gate:
         reason = redact("card body carries no ```gate block — nothing to gate on; add one and requeue")
-        board.block(task_id, reason, kind="needs_input")
-        return 2
+        return 4 if not _blocked(board, task_id, reason, kind="needs_input") else 2
 
     text = f"{task.get('title') or ''}\n\n{task.get('body') or ''}"
     try:
         outcome = run_card(text, gate, task.get("workspace_path"))
     except Exception as exc:  # noqa: BLE001 — a dead rig is a blocked card, not a crash
-        board.block(task_id, redact(f"rig error: {exc}"))
+        if not _blocked(board, task_id, redact(f"rig error: {exc}")):
+            return 4
         return 1
 
     if outcome.passed:
@@ -198,8 +262,14 @@ def work(task_id: str, board: HermesKanban, run_card: Callable[..., CardOutcome]
         return 0
 
     reason = redact(f"gate failed: {outcome.tests_passed}/{outcome.tests_total} — {outcome.reason}")
-    board.block(task_id, reason)
+    if not _blocked(board, task_id, reason):
+        return 4
     return 1
+
+
+def _hardened_git() -> list[str]:
+    """The same flags the sandbox uses for host-side git, plus visible non-ASCII names."""
+    return ["git", *GitSandbox._HARDENED_GIT, "-c", "core.quotePath=false"]
 
 
 def changed_files(workspace: str | Path | None, base: str) -> list[str]:
@@ -211,7 +281,7 @@ def changed_files(workspace: str | Path | None, base: str) -> list[str]:
         return []
     try:
         proc = subprocess.run(
-            ["git", "-C", str(ws), "diff", "--name-only", base, "HEAD"],
+            [*_hardened_git(), "-C", str(ws), "diff", "--name-only", base, "HEAD"],
             capture_output=True,
             text=True,
             timeout=DEFAULT_TIMEOUT,
@@ -223,26 +293,58 @@ def changed_files(workspace: str | Path | None, base: str) -> list[str]:
     return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip()})
 
 
-def make_rig_runner(cfg: Any, *, rig_factory: Any = None) -> Callable[[str, str, Any], CardOutcome]:
+def make_rig_runner(
+    cfg: Any, *, rig_factory: Any = None, explicit_repo: str | Path | None = None
+) -> Callable[[str, str, Any], CardOutcome]:
     """Turn a :class:`dacode.config.DaCodeConfig` into a ``run_card`` for :func:`work`.
 
     The card's gate becomes the rig's test command and the card's git workspace
     becomes the repo — the caller's config is copied, never mutated.
+    ``explicit_repo`` is the ``--repo`` the operator actually passed (before
+    config resolution): it wins over the card's ``workspace_path``, and a
+    mismatch is refused rather than silently working some other checkout. A
+    card workspace under ``$HOME`` is refused outright — binding it read-write
+    would re-expose the home directory the sandbox just emptied.
     """
     if rig_factory is None:
         from dacode.orchestrator import DaCodeRig  # lazy: pulls in the llm stack
 
         rig_factory = DaCodeRig
 
+    from dacode.env import DEFAULT_ENV_PATHS, load_env  # light, and only needed here
+
     def run_card(task: str, gate: str, workspace: Any) -> CardOutcome:
-        repo = Path(workspace) if workspace and (Path(workspace) / ".git").exists() else cfg.repo
+        repo = cfg.repo
+        if workspace:
+            card_ws = Path(workspace).expanduser()
+            if card_ws.is_dir() and (card_ws / ".git").exists():
+                card_ws = card_ws.resolve()
+                if explicit_repo:
+                    wanted = Path(explicit_repo).expanduser().resolve()
+                    if card_ws != wanted:
+                        raise ValueError(
+                            f"card workspace_path {card_ws} conflicts with --repo {wanted} — "
+                            "drop --repo or fix the card's workspace"
+                        )
+                    repo = wanted
+                else:
+                    if exposes_home(card_ws):
+                        raise ValueError(
+                            "card workspace_path sits under $HOME (or holds credentials) — "
+                            "binding it read-write would re-expose the home directory inside "
+                            "the sandbox; work from a checkout outside $HOME"
+                        )
+                    repo = card_ws
+                    # main() loaded .env from cwd/--repo; this card's checkout has
+                    # its own. load_env never clobbers, so only missing keys fill in.
+                    load_env(*[p.replace("{repo}", str(repo)) for p in DEFAULT_ENV_PATHS])
         new_cfg = dataclasses.replace(
             cfg, test_command=("bash", "-c", gate), isolate="bwrap", repo=repo
         )
 
         try:
             proc = subprocess.run(
-                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                [*_hardened_git(), "-C", str(repo), "rev-parse", "HEAD"],
                 capture_output=True,
                 text=True,
                 timeout=DEFAULT_TIMEOUT,
@@ -256,7 +358,9 @@ def make_rig_runner(cfg: Any, *, rig_factory: Any = None) -> Callable[[str, str,
         if probe is not None:
             worktree = probe.workspace or None
             tail = (probe.gate_output or probe.stdout or "")[-2000:]
-            diffs = changed_files(probe.workspace, base)
+            # diffs are evidence for the *complete* path only; a failed run never
+            # diffs — probe.workspace may not even be a valid checkout then.
+            diffs = changed_files(probe.workspace, base) if result.passed else []
         else:
             worktree, tail, diffs = None, "", []
         if result.passed:

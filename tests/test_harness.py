@@ -132,3 +132,22 @@ def test_run_picks_the_variant_that_makes_tests_pass(rig_repo):
     # the loser's worktree was cleaned up, the winner's was kept
     assert not Path(bad.probe.workspace).exists()
     assert Path(result.best.probe.workspace).exists()
+
+
+def test_gate_evidence_keeps_stderr_when_stdout_is_silent():
+    # `python -m unittest` reports on stderr only, and a gate that timed out
+    # (124) / was refused (125) / found no command (127) writes only there —
+    # gate_output used to fall back to the executor's chatter in both cases.
+    from types import SimpleNamespace
+
+    from dacode.harness.optimizer import _gate_evidence
+
+    assert _gate_evidence(
+        SimpleNamespace(stdout="", stderr="Ran 4 tests in 0.1s\nOK")
+    ) == "Ran 4 tests in 0.1s\nOK"
+    assert _gate_evidence(SimpleNamespace(stdout="1 passed", stderr="")) == "1 passed"
+    assert _gate_evidence(
+        SimpleNamespace(stdout="counts line", stderr="isolation detail")
+    ) == "counts line\nisolation detail"
+    assert _gate_evidence(SimpleNamespace(stdout=None, stderr=None)) == ""
+    assert len(_gate_evidence(SimpleNamespace(stdout="x" * 5000, stderr="y" * 3000))) == 4000

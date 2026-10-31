@@ -63,6 +63,36 @@ def test_the_workspace_is_the_only_writable_place():
     assert argv[index + 1] == argv[index + 2] == str(Path.cwd().resolve())
 
 
+def test_read_only_workspace_binds_read_only(tmp_path):
+    # The baseline measures the live main checkout: its bind must not be the
+    # writable one a trial workspace gets.
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    argv = _argv(workspace=ws, read_only_workspace=True)
+    assert ["--ro-bind", str(ws.resolve()), str(ws.resolve())] in [
+        argv[i:i + 3] for i in range(len(argv) - 2)
+    ]
+    assert ["--bind", str(ws.resolve()), str(ws.resolve())] not in [
+        argv[i:i + 3] for i in range(len(argv) - 2)
+    ]
+
+
+def test_exposes_home_flags_the_workspace_that_would_re_expose_home(tmp_path, monkeypatch):
+    from dacode.sandbox.bwrap import exposes_home
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path(home)))
+
+    (home / ".git").mkdir()                    # $HOME made into a checkout
+    assert exposes_home(home) is True
+    outside = tmp_path / "repos" / "plain"
+    outside.mkdir(parents=True)
+    assert exposes_home(outside) is False
+    assert exposes_home(tmp_path) is True      # an ancestor of $HOME contains it
+
+
 def test_home_is_replaced_by_an_empty_tmpfs():
     argv = _argv(home=Path.home())
     index = argv.index("--tmpfs")

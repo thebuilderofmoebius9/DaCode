@@ -379,17 +379,29 @@ dacode kanban work t_1485ddf4 --board myboard \
 
 1. **claim** first (`hermes kanban claim`, atomic). A card someone else holds
    exits `3` and nothing runs — no card is worked twice. The claim TTL covers
-   `budget × variants × variant-timeout` (+10 min) unless `--ttl` is given.
-2. **gate** — the first ```` ```gate ```` block becomes the test command. No gate →
-   `block --kind needs_input`, exit `2`.
+   `budget × variants × 2 × variant-timeout + variant-timeout` (+10 min) unless
+   `--ttl` is given — each variant can spend a full timeout executing and
+   another inside the critic's gate, and the baseline spends one more. Any
+   other claim failure (typo'd id, unknown board) exits `5`, not a fake
+   "another worker owns the card".
+2. **gate** — the first closed ```` ```gate ```` block becomes the test command.
+   No gate → `block --kind needs_input`, exit `2`. An unclosed ```` ```gate ````
+   fence is not a gate, and a ````markdown example block does not leak its
+   inner ```gate lines as one.
 3. **run** — the rig runs under `--isolate bwrap` (always, for cards). A card whose
    workspace is a git checkout (`--workspace dir:<repo>`) is worked there;
-   otherwise `--repo`.
-4. **report** — pass → `complete` with `--metadata` (gate, gate output, tests
-   passed/total, changed files, winning worktree, runlog path), exit `0`;
-   fail or a rig error → `block` with tests x/y and the reason, exit `1`. A lost
-   claim at the end is exit `4`, never a silent success. Everything sent to the
-   board goes through `redact()`.
+   otherwise `--repo`. An explicit `--repo` wins: a card workspace that points
+   somewhere else is refused, and a workspace under `$HOME` is refused
+   outright (binding it read-write would re-expose the home directory the
+   sandbox emptied). The card checkout's own `.env` is loaded for
+   allow-listed keys the host shell did not already provide.
+4. **report** — pass → `complete` with `--metadata` (gate, gate output — gate
+   stderr included, so `unittest` suites and gate timeouts are visible —
+   tests passed/total, changed files, winning worktree, runlog path), exit `0`;
+   fail or a rig error → `block` with tests x/y and the reason, exit `1`. A
+   lost claim at the end is exit `4`, never a silent success; a board call
+   that failed outright is exit `5`. Everything sent to the board goes
+   through `redact()`.
 
 `DACODE_KANBAN_BIN` / `DACODE_KANBAN_BOARD` override the `hermes` binary and the
 board. As with `dacode run`, the winner is a proposal: review the worktree diff
